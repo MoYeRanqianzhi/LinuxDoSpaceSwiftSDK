@@ -45,6 +45,7 @@ public final actor MailBox {
 
     private var closed = false
     private var listening = false
+    private var failure: Error?
     private var queue: [MailMessage] = []
     private let unbind: @Sendable () async -> Void
 
@@ -70,7 +71,12 @@ public final actor MailBox {
                     return
                 }
                 listening = true
+                defer { listening = false }
                 while !closed {
+                    if let failure {
+                        continuation.finish(throwing: failure)
+                        return
+                    }
                     if !queue.isEmpty {
                         continuation.yield(queue.removeFirst())
                     } else {
@@ -91,6 +97,11 @@ public final actor MailBox {
     func enqueue(_ message: MailMessage) {
         if closed || !listening { return }
         queue.append(message)
+    }
+
+    func fail(_ error: Error) {
+        if closed { return }
+        failure = error
     }
 }
 
@@ -118,6 +129,7 @@ public final class Client: @unchecked Sendable {
     private let streamTimeout: TimeInterval
     private let lock = NSLock()
     private var closed = false
+    private var fatalError: LinuxDoSpaceError?
     private var fullQueue: [MailMessage] = []
     private var bindingsBySuffix: [String: [Binding]] = [:]
     private var readerTask: Task<Void, Never>?
@@ -143,8 +155,13 @@ public final class Client: @unchecked Sendable {
                 while let self, !Task.isCancelled {
                     self.lock.lock()
                     let localClosed = self.closed
+                    let failure = self.fatalError
                     let item = self.fullQueue.isEmpty ? nil : self.fullQueue.removeFirst()
                     self.lock.unlock()
+                    if let failure {
+                        continuation.finish(throwing: failure)
+                        return
+                    }
                     if localClosed { continuation.finish(); return }
                     if let item {
                         continuation.yield(item)
@@ -158,6 +175,12 @@ public final class Client: @unchecked Sendable {
     }
 
     public func bind(prefix: String? = nil, pattern: String? = nil, suffix: String = Suffix.linuxdoSpace.rawValue, allowOverlap: Bool = false) throws -> MailBox {
+        lock.lock()
+        let failure = fatalError
+        let localClosed = closed
+        lock.unlock()
+        if let failure { throw failure }
+        if localClosed { throw LinuxDoSpaceError.streamFailed("client is already closed") }
         let hasPrefix = !(prefix ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasPattern = !(pattern ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if hasPrefix == hasPattern { throw LinuxDoSpaceError.invalidArgument("exactly one of prefix or pattern must be provided") }
@@ -207,10 +230,16 @@ public final class Client: @unchecked Sendable {
         while !Task.isCancelled {
             do {
                 try await consumeOnce()
+            } catch let error as LinuxDoSpaceError {
+                if case .streamFailed(let message) = error, message == "stream stalled" {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
+                }
+                await failAll(error)
+                return
             } catch {
-                // Keep reconnecting for resilience.
+                try? await Task.sleep(nanoseconds: 300_000_000)
             }
-            try? await Task.sleep(nanoseconds: 300_000_000)
         }
     }
 
@@ -226,7 +255,7 @@ public final class Client: @unchecked Sendable {
         if http.statusCode == 401 || http.statusCode == 403 { throw LinuxDoSpaceError.authenticationFailed("token rejected") }
         if !(200...299).contains(http.statusCode) { throw LinuxDoSpaceError.streamFailed("unexpected stream status: \(http.statusCode)") }
 
-        let lastData = Date()
+        var lastData = Date()
         for try await line in bytes.lines {
             if Task.isCancelled { return }
             if Date().timeIntervalSince(lastData) > streamTimeout {
@@ -234,6 +263,7 @@ public final class Client: @unchecked Sendable {
             }
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
+            lastData = Date()
             try handleLine(trimmed)
         }
     }
@@ -298,6 +328,21 @@ public final class Client: @unchecked Sendable {
             if !b.allowOverlap { break }
         }
         return matched
+    }
+
+    private func failAll(_ error: LinuxDoSpaceError) async {
+        lock.lock()
+        fatalError = error
+        closed = true
+        let boxes = bindingsBySuffix.values.flatMap { $0.map(\.mailbox) }
+        bindingsBySuffix.removeAll()
+        lock.unlock()
+
+        for box in boxes {
+            await box.fail(error)
+            await box.close()
+        }
+        readerTask?.cancel()
     }
 
     private static func normalizeBaseURL(_ value: String) -> URL? {
