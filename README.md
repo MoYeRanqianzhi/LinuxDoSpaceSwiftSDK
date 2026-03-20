@@ -6,9 +6,11 @@ This directory contains a Swift SDK implementation for LinuxDoSpace mail stream 
 
 - `Client`, `Suffix`, `MailMessage`
 - Errors: `LinuxDoSpaceError.authenticationFailed` and stream errors
-- Full token listener stream
+- Full token listener stream (broadcast semantics for concurrent listeners)
 - Local bind (exact/regex), ordered matching chain, overlap control
 - `route`, `close`
+- Multi-recipient dispatch keeps mailbox `message.address` as current recipient
+- MIME header/body parsing fills common fields (`subject`, address headers, text/html)
 
 ## Local Verification Status
 

@@ -47,6 +47,7 @@ public final actor MailBox {
     private var listening = false
     private var failure: Error?
     private var queue: [MailMessage] = []
+    private var continuation: AsyncThrowingStream<MailMessage, Error>.Continuation?
     private let unbind: @Sendable () async -> Void
 
     init(mode: String, suffix: String, allowOverlap: Bool, prefix: String?, pattern: String?, unbind: @escaping @Sendable () async -> Void) {
@@ -61,47 +62,67 @@ public final actor MailBox {
 
     public func listen() -> AsyncThrowingStream<MailMessage, Error> {
         AsyncThrowingStream { continuation in
-            Task {
-                if closed {
-                    continuation.finish(throwing: LinuxDoSpaceError.mailboxClosed)
-                    return
-                }
-                if listening {
-                    continuation.finish(throwing: LinuxDoSpaceError.mailboxAlreadyListening)
-                    return
-                }
-                listening = true
-                defer { listening = false }
-                while !closed {
-                    if let failure {
-                        continuation.finish(throwing: failure)
-                        return
-                    }
-                    if !queue.isEmpty {
-                        continuation.yield(queue.removeFirst())
-                    } else {
-                        try? await Task.sleep(nanoseconds: 50_000_000)
-                    }
-                }
-                continuation.finish()
-            }
+            Task { await self.attachListener(continuation) }
         }
     }
 
     public func close() async {
         if closed { return }
         closed = true
+        continuation?.finish()
+        continuation = nil
+        listening = false
+        queue.removeAll(keepingCapacity: false)
         await unbind()
     }
 
     func enqueue(_ message: MailMessage) {
         if closed || !listening { return }
         queue.append(message)
+        flushQueue()
     }
 
     func fail(_ error: Error) {
         if closed { return }
         failure = error
+        continuation?.finish(throwing: error)
+        continuation = nil
+        listening = false
+        queue.removeAll(keepingCapacity: false)
+    }
+
+    private func attachListener(_ continuation: AsyncThrowingStream<MailMessage, Error>.Continuation) {
+        if closed {
+            continuation.finish(throwing: LinuxDoSpaceError.mailboxClosed)
+            return
+        }
+        if listening {
+            continuation.finish(throwing: LinuxDoSpaceError.mailboxAlreadyListening)
+            return
+        }
+        if let failure {
+            continuation.finish(throwing: failure)
+            return
+        }
+        listening = true
+        self.continuation = continuation
+        continuation.onTermination = { _ in
+            Task { await self.listenerTerminated() }
+        }
+        flushQueue()
+    }
+
+    private func listenerTerminated() {
+        continuation = nil
+        listening = false
+        queue.removeAll(keepingCapacity: false)
+    }
+
+    private func flushQueue() {
+        guard let continuation else { return }
+        while !queue.isEmpty {
+            continuation.yield(queue.removeFirst())
+        }
     }
 }
 
@@ -130,7 +151,7 @@ public final class Client: @unchecked Sendable {
     private let lock = NSLock()
     private var closed = false
     private var fatalError: LinuxDoSpaceError?
-    private var fullQueue: [MailMessage] = []
+    private var fullListeners: [UUID: AsyncThrowingStream<MailMessage, Error>.Continuation] = [:]
     private var bindingsBySuffix: [String: [Binding]] = [:]
     private var readerTask: Task<Void, Never>?
 
@@ -151,25 +172,25 @@ public final class Client: @unchecked Sendable {
 
     public func listen() -> AsyncThrowingStream<MailMessage, Error> {
         AsyncThrowingStream { continuation in
-            Task.detached { [weak self] in
-                while let self, !Task.isCancelled {
-                    self.lock.lock()
-                    let localClosed = self.closed
-                    let failure = self.fatalError
-                    let item = self.fullQueue.isEmpty ? nil : self.fullQueue.removeFirst()
-                    self.lock.unlock()
-                    if let failure {
-                        continuation.finish(throwing: failure)
-                        return
-                    }
-                    if localClosed { continuation.finish(); return }
-                    if let item {
-                        continuation.yield(item)
-                    } else {
-                        try? await Task.sleep(nanoseconds: 50_000_000)
-                    }
-                }
+            lock.lock()
+            if let failure = fatalError {
+                lock.unlock()
+                continuation.finish(throwing: failure)
+                return
+            }
+            if closed {
+                lock.unlock()
                 continuation.finish()
+                return
+            }
+            let listenerID = UUID()
+            fullListeners[listenerID] = continuation
+            lock.unlock()
+
+            continuation.onTermination = { _ in
+                self.lock.lock()
+                self.fullListeners.removeValue(forKey: listenerID)
+                self.lock.unlock()
             }
         }
     }
@@ -219,9 +240,14 @@ public final class Client: @unchecked Sendable {
         lock.lock()
         if closed { lock.unlock(); return }
         closed = true
+        let listeners = Array(fullListeners.values)
+        fullListeners.removeAll()
         let boxes = bindingsBySuffix.values.flatMap { $0.map(\.mailbox) }
         bindingsBySuffix.removeAll()
         lock.unlock()
+        for continuation in listeners {
+            continuation.finish()
+        }
         for box in boxes { await box.close() }
         readerTask?.cancel()
     }
@@ -276,37 +302,37 @@ public final class Client: @unchecked Sendable {
         }
         if type == "ready" || type == "heartbeat" { return }
         if type != "mail" { return }
-        let recipients = ((json["original_recipients"] as? [Any]) ?? []).compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty }
+        let recipients = ((json["original_recipients"] as? [Any]) ?? [])
+            .compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        let sender = (json["original_envelope_from"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let receivedAtText = (json["received_at"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let receivedAt = ISO8601DateFormatter().date(from: receivedAtText) ?? Date()
+        let rawBytes = Data(base64Encoded: json["raw_message_base64"] as? String ?? "") ?? Data()
+        let rawText = String(data: rawBytes, encoding: .utf8) ?? String(decoding: rawBytes, as: UTF8.self)
+        let parsed = parseRawMessage(rawText)
         let primary = recipients.first ?? ""
-        let message = MailMessage(
+        let fullMessage = parsed.toMailMessage(
             address: primary,
-            sender: (json["original_envelope_from"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+            sender: sender,
             recipients: recipients,
-            receivedAt: ISO8601DateFormatter().date(from: (json["received_at"] as? String ?? "")) ?? Date(),
-            subject: "",
-            messageId: nil,
-            date: nil,
-            fromHeader: "",
-            toHeader: "",
-            ccHeader: "",
-            replyToHeader: "",
-            fromAddresses: [],
-            toAddresses: [],
-            ccAddresses: [],
-            replyToAddresses: [],
-            text: "",
-            html: "",
-            headers: [:],
-            raw: "",
-            rawBytes: Data(base64Encoded: json["raw_message_base64"] as? String ?? "") ?? Data()
+            receivedAt: receivedAt,
+            rawBytes: rawBytes,
+            raw: rawText
         )
-        lock.lock()
-        fullQueue.append(message)
-        lock.unlock()
+        broadcastToFullListeners(fullMessage)
         var seen = Set<String>()
         for recipient in recipients where seen.insert(recipient).inserted {
+            let recipientMessage = parsed.toMailMessage(
+                address: recipient,
+                sender: sender,
+                recipients: recipients,
+                receivedAt: receivedAt,
+                rawBytes: rawBytes,
+                raw: rawText
+            )
             for binding in matchBindings(address: recipient) {
-                Task { await binding.mailbox.enqueue(message) }
+                Task { await binding.mailbox.enqueue(recipientMessage) }
             }
         }
     }
@@ -334,15 +360,29 @@ public final class Client: @unchecked Sendable {
         lock.lock()
         fatalError = error
         closed = true
+        let listeners = Array(fullListeners.values)
+        fullListeners.removeAll()
         let boxes = bindingsBySuffix.values.flatMap { $0.map(\.mailbox) }
         bindingsBySuffix.removeAll()
         lock.unlock()
+        for continuation in listeners {
+            continuation.finish(throwing: error)
+        }
 
         for box in boxes {
             await box.fail(error)
             await box.close()
         }
         readerTask?.cancel()
+    }
+
+    private func broadcastToFullListeners(_ message: MailMessage) {
+        lock.lock()
+        let listeners = Array(fullListeners.values)
+        lock.unlock()
+        for continuation in listeners {
+            continuation.yield(message)
+        }
     }
 
     private static func normalizeBaseURL(_ value: String) -> URL? {
@@ -354,5 +394,175 @@ public final class Client: @unchecked Sendable {
             if !local { return nil }
         }
         return URL(string: trimmed)
+    }
+
+    private struct ParsedRawMessage {
+        let subject: String
+        let messageId: String?
+        let date: Date?
+        let fromHeader: String
+        let toHeader: String
+        let ccHeader: String
+        let replyToHeader: String
+        let fromAddresses: [String]
+        let toAddresses: [String]
+        let ccAddresses: [String]
+        let replyToAddresses: [String]
+        let text: String
+        let html: String
+        let headers: [String: String]
+
+        func toMailMessage(address: String, sender: String, recipients: [String], receivedAt: Date, rawBytes: Data, raw: String) -> MailMessage {
+            MailMessage(
+                address: address,
+                sender: sender,
+                recipients: recipients,
+                receivedAt: receivedAt,
+                subject: subject,
+                messageId: messageId,
+                date: date,
+                fromHeader: fromHeader,
+                toHeader: toHeader,
+                ccHeader: ccHeader,
+                replyToHeader: replyToHeader,
+                fromAddresses: fromAddresses,
+                toAddresses: toAddresses,
+                ccAddresses: ccAddresses,
+                replyToAddresses: replyToAddresses,
+                text: text,
+                html: html,
+                headers: headers,
+                raw: raw,
+                rawBytes: rawBytes
+            )
+        }
+    }
+
+    private func parseRawMessage(_ raw: String) -> ParsedRawMessage {
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
+        let splitRange = normalized.range(of: "\n\n")
+        let headerText = splitRange.map { String(normalized[..<$0.lowerBound]) } ?? normalized
+        let bodyText = splitRange.map { String(normalized[$0.upperBound...]) } ?? ""
+        let headers = parseHeaders(headerText)
+        let contentType = headers["Content-Type"] ?? ""
+        let extractedBody = extractBody(contentType: contentType, body: bodyText)
+        return ParsedRawMessage(
+            subject: headers["Subject"] ?? "",
+            messageId: optionalHeader(headers, key: "Message-ID"),
+            date: parseMailDate(optionalHeader(headers, key: "Date")),
+            fromHeader: headers["From"] ?? "",
+            toHeader: headers["To"] ?? "",
+            ccHeader: headers["Cc"] ?? "",
+            replyToHeader: headers["Reply-To"] ?? "",
+            fromAddresses: parseAddresses(headers["From"] ?? ""),
+            toAddresses: parseAddresses(headers["To"] ?? ""),
+            ccAddresses: parseAddresses(headers["Cc"] ?? ""),
+            replyToAddresses: parseAddresses(headers["Reply-To"] ?? ""),
+            text: extractedBody.text,
+            html: extractedBody.html,
+            headers: headers
+        )
+    }
+
+    private func parseHeaders(_ source: String) -> [String: String] {
+        var headers: [String: String] = [:]
+        var activeKey: String?
+        for line in source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            if line.isEmpty { continue }
+            if (line.hasPrefix(" ") || line.hasPrefix("\t")), let activeKey {
+                let current = headers[activeKey] ?? ""
+                headers[activeKey] = current + " " + line.trimmingCharacters(in: .whitespacesAndNewlines)
+                continue
+            }
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<colon]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            headers[key] = value
+            activeKey = key
+        }
+        return headers
+    }
+
+    private func extractBody(contentType: String, body: String) -> (text: String, html: String) {
+        let loweredType = contentType.lowercased()
+        if loweredType.contains("multipart/"), let boundary = parseBoundary(contentType: contentType) {
+            let delimiter = "--\(boundary)"
+            let endDelimiter = "--\(boundary)--"
+            var textParts: [String] = []
+            var htmlParts: [String] = []
+            var collecting = false
+            var current: [String] = []
+            for line in body.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+                if line == delimiter || line == endDelimiter {
+                    if collecting, !current.isEmpty {
+                        let part = current.joined(separator: "\n")
+                        current.removeAll(keepingCapacity: false)
+                        let splitRange = part.range(of: "\n\n")
+                        let partHead = splitRange.map { String(part[..<$0.lowerBound]) } ?? part
+                        let partBody = splitRange.map { String(part[$0.upperBound...]) } ?? ""
+                        let partHeaders = parseHeaders(partHead)
+                        let partType = (partHeaders["Content-Type"] ?? "").lowercased()
+                        if partType.contains("text/plain") {
+                            textParts.append(partBody.trimmingCharacters(in: .whitespacesAndNewlines))
+                        } else if partType.contains("text/html") {
+                            htmlParts.append(partBody.trimmingCharacters(in: .whitespacesAndNewlines))
+                        }
+                    }
+                    collecting = line != endDelimiter
+                    continue
+                }
+                if collecting {
+                    current.append(line)
+                }
+            }
+            return (textParts.joined(separator: "\n"), htmlParts.joined(separator: "\n"))
+        }
+        if loweredType.contains("text/html") {
+            return ("", body.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return (body.trimmingCharacters(in: .whitespacesAndNewlines), "")
+    }
+
+    private func parseBoundary(contentType: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: "boundary=([^;]+)", options: [.caseInsensitive]) else { return nil }
+        let nsRange = NSRange(location: 0, length: contentType.utf16.count)
+        guard let match = regex.firstMatch(in: contentType, options: [], range: nsRange), match.numberOfRanges > 1 else { return nil }
+        guard let range = Range(match.range(at: 1), in: contentType) else { return nil }
+        var boundary = String(contentType[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if boundary.hasPrefix("\""), boundary.hasSuffix("\""), boundary.count >= 2 {
+            boundary.removeFirst()
+            boundary.removeLast()
+        }
+        return boundary.isEmpty ? nil : boundary
+    }
+
+    private func parseAddresses(_ value: String) -> [String] {
+        value
+            .split(separator: ",")
+            .compactMap { chunk in
+                let trimmed = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let left = trimmed.firstIndex(of: "<"), let right = trimmed.firstIndex(of: ">"), left < right {
+                    let mail = trimmed[trimmed.index(after: left)..<right].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    return mail.contains("@") ? mail : nil
+                }
+                let lower = trimmed.lowercased()
+                return lower.contains("@") ? lower : nil
+            }
+    }
+
+    private func optionalHeader(_ headers: [String: String], key: String) -> String? {
+        guard let value = headers[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        return value
+    }
+
+    private func parseMailDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        if let iso = ISO8601DateFormatter().date(from: value) {
+            return iso
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE, d MMM yyyy HH:mm:ss Z"
+        return formatter.date(from: value)
     }
 }
