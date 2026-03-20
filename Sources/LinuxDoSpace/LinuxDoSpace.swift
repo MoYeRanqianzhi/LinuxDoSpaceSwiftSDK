@@ -1,6 +1,8 @@
 import Foundation
 
 public enum Suffix: String, Sendable {
+    /// Semantic first-party namespace suffix resolved as
+    /// `<owner_username>.linuxdo.space` after the ready handshake.
     case linuxdoSpace = "linuxdo.space"
 }
 
@@ -151,6 +153,10 @@ public final class Client: @unchecked Sendable {
     private let lock = NSLock()
     private var closed = false
     private var fatalError: LinuxDoSpaceError?
+    private var initialError: LinuxDoSpaceError?
+    private var ownerUsername: String?
+    private var initialReadySignaled = false
+    private let initialReadySemaphore = DispatchSemaphore(value: 0)
     private var fullListeners: [UUID: AsyncThrowingStream<MailMessage, Error>.Continuation] = [:]
     private var bindingsBySuffix: [String: [Binding]] = [:]
     private var readerTask: Task<Void, Never>?
@@ -164,6 +170,15 @@ public final class Client: @unchecked Sendable {
         self.connectTimeout = connectTimeout
         self.streamTimeout = streamTimeout
         self.readerTask = Task.detached { [weak self] in await self?.readLoop() }
+        let timeoutInterval = DispatchTimeInterval.milliseconds(Int((connectTimeout + 1) * 1000))
+        if initialReadySemaphore.wait(timeout: .now() + timeoutInterval) == .timedOut {
+            readerTask?.cancel()
+            throw LinuxDoSpaceError.streamFailed("timed out while opening LinuxDoSpace stream")
+        }
+        if let initialError {
+            readerTask?.cancel()
+            throw initialError
+        }
     }
 
     deinit {
@@ -205,7 +220,7 @@ public final class Client: @unchecked Sendable {
         let hasPrefix = !(prefix ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasPattern = !(pattern ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if hasPrefix == hasPattern { throw LinuxDoSpaceError.invalidArgument("exactly one of prefix or pattern must be provided") }
-        let normalizedSuffix = suffix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedSuffix = try resolveBindingSuffix(suffix)
         if normalizedSuffix.isEmpty { throw LinuxDoSpaceError.invalidArgument("suffix must not be empty") }
 
         let normalizedPrefix = hasPrefix ? prefix!.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() : nil
@@ -261,9 +276,11 @@ public final class Client: @unchecked Sendable {
                     try? await Task.sleep(nanoseconds: 300_000_000)
                     continue
                 }
+                signalInitialReadyIfNeeded(error: error)
                 await failAll(error)
                 return
             } catch {
+                signalInitialReadyIfNeeded(error: .streamFailed("unexpected stream failure"))
                 try? await Task.sleep(nanoseconds: 300_000_000)
             }
         }
@@ -292,6 +309,7 @@ public final class Client: @unchecked Sendable {
             lastData = Date()
             try handleLine(trimmed)
         }
+        signalInitialReadyIfNeeded(error: .streamFailed("mail stream ended before ready event"))
     }
 
     private func handleLine(_ line: String) throws {
@@ -300,7 +318,11 @@ public final class Client: @unchecked Sendable {
               let type = json["type"] as? String else {
             throw LinuxDoSpaceError.streamFailed("invalid NDJSON event")
         }
-        if type == "ready" || type == "heartbeat" { return }
+        if type == "ready" {
+            try handleReady(json)
+            return
+        }
+        if type == "heartbeat" { return }
         if type != "mail" { return }
         let recipients = ((json["original_recipients"] as? [Any]) ?? [])
             .compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -383,6 +405,53 @@ public final class Client: @unchecked Sendable {
         for continuation in listeners {
             continuation.yield(message)
         }
+    }
+
+    private func handleReady(_ payload: [String: Any]) throws {
+        let ownerUsername = (payload["owner_username"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if ownerUsername.isEmpty {
+            throw LinuxDoSpaceError.streamFailed("ready event did not include owner_username")
+        }
+
+        lock.lock()
+        self.ownerUsername = ownerUsername
+        lock.unlock()
+        signalInitialReadyIfNeeded(error: nil)
+    }
+
+    private func resolveBindingSuffix(_ suffix: String) throws -> String {
+        let normalizedSuffix = suffix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedSuffix.isEmpty {
+            throw LinuxDoSpaceError.invalidArgument("suffix must not be empty")
+        }
+        if normalizedSuffix != Suffix.linuxdoSpace.rawValue {
+            return normalizedSuffix
+        }
+
+        lock.lock()
+        let ownerUsername = self.ownerUsername
+        lock.unlock()
+        let normalizedOwnerUsername = (ownerUsername ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedOwnerUsername.isEmpty {
+            throw LinuxDoSpaceError.streamFailed("stream bootstrap did not provide owner_username required to resolve Suffix.linuxdoSpace")
+        }
+        return "\(normalizedOwnerUsername).\(normalizedSuffix)"
+    }
+
+    private func signalInitialReadyIfNeeded(error: LinuxDoSpaceError?) {
+        lock.lock()
+        if initialReadySignaled {
+            lock.unlock()
+            return
+        }
+        initialReadySignaled = true
+        if let error {
+            initialError = error
+        }
+        lock.unlock()
+        initialReadySemaphore.signal()
     }
 
     private static func normalizeBaseURL(_ value: String) -> URL? {
