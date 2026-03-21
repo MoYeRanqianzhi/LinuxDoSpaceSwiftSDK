@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinuxDoSpace Swift SDK"
+  short_description: "Use or maintain the LinuxDoSpace Swift SDK"
+  default_prompt: "Use $linuxdo-space-swift-sdk when writing consumer code against sdk/swift or when updating the LinuxDoSpace Swift SDK with matching docs and validation guidance."
