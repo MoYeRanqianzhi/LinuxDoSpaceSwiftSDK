@@ -27,4 +27,3 @@
 - Exact and regex bindings share one ordered chain per suffix.
 - `bind(...)` requires exactly one of `prefix` or `pattern`.
 - Regex bindings are full-match local-part regexes.
-

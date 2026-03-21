@@ -17,4 +17,3 @@ let catchAll = try client.bind(pattern: ".*", suffix: .linuxdoSpace, allowOverla
 ```swift
 let targets = client.route(message)
 ```
-

@@ -32,4 +32,3 @@ Read [references/development.md](references/development.md) only when editing `s
 - Do not document CocoaPods/Carthage/XCFramework publication; current release output is source archives.
 - Do not add hidden pre-listen mailbox buffering.
 - Do not imply there is a separate `bindExact` / `bindPattern` API; Swift uses one unified `bind(...)`.
-

@@ -36,4 +36,3 @@ await box.close()
 - `route(_:)` is local matching only.
 - Full-stream messages use a primary projection address.
 - Mailbox messages use matched-recipient projection addresses.
-
