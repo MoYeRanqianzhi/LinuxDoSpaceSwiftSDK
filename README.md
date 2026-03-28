@@ -15,7 +15,14 @@ This directory contains a Swift SDK implementation for LinuxDoSpace mail stream 
 Important:
 
 - `Suffix.linuxdoSpace` is semantic, not literal
-- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
+- `Suffix.linuxdoSpace` now resolves to the current token owner's canonical
+  mail namespace: `<owner_username>-mail.linuxdo.space`
+- `try Suffix.linuxdoSpace.withSuffix("foo")` resolves to
+  `<owner_username>-mailfoo.linuxdo.space`
+- active semantic `-mail<suffix>` registrations are synchronized to
+  `PUT /v1/token/email/filters`
+- the legacy default alias `<owner_username>.linuxdo.space` still matches the
+  default semantic binding automatically
 
 ## Local Verification Status
 

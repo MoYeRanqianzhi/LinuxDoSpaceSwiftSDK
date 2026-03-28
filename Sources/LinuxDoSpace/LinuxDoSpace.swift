@@ -1,9 +1,60 @@
 import Foundation
 
 public enum Suffix: String, Sendable {
-    /// Semantic first-party namespace suffix resolved as
-    /// `<owner_username>.linuxdo.space` after the ready handshake.
+    /// Semantic first-party namespace suffix resolved against the current
+    /// token owner's canonical `@<owner>-mail.linuxdo.space` namespace.
     case linuxdoSpace = "linuxdo.space"
+
+    public func withSuffix(_ fragment: String) throws -> SemanticSuffix {
+        try SemanticSuffix(base: self, fragment: fragment)
+    }
+}
+
+public struct SemanticSuffix: Sendable {
+    public let base: Suffix
+    public let mailSuffixFragment: String
+
+    public init(base: Suffix, fragment: String) throws {
+        self.base = base
+        self.mailSuffixFragment = try Self.normalize(fragment)
+    }
+
+    public func withSuffix(_ fragment: String) throws -> SemanticSuffix {
+        try SemanticSuffix(base: base, fragment: fragment)
+    }
+
+    private static func normalize(_ raw: String) throws -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value.isEmpty {
+            return ""
+        }
+
+        var normalized = ""
+        var lastWasDash = false
+        for character in value {
+            if character.isLetter || character.isNumber {
+                normalized.append(character)
+                lastWasDash = false
+                continue
+            }
+            if !lastWasDash {
+                normalized.append("-")
+                lastWasDash = true
+            }
+        }
+
+        normalized = normalized.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        if normalized.isEmpty {
+            throw LinuxDoSpaceError.invalidArgument("mail suffix fragment does not contain any valid dns characters")
+        }
+        if normalized.contains(".") {
+            throw LinuxDoSpaceError.invalidArgument("mail suffix fragment must stay inside one dns label")
+        }
+        if normalized.count > 48 {
+            throw LinuxDoSpaceError.invalidArgument("mail suffix fragment must be 48 characters or fewer")
+        }
+        return normalized
+    }
 }
 
 public enum LinuxDoSpaceError: Error, Sendable {
@@ -155,6 +206,7 @@ public final class Client: @unchecked Sendable {
     private var fatalError: LinuxDoSpaceError?
     private var initialError: LinuxDoSpaceError?
     private var ownerUsername: String?
+    private var syncedMailboxSuffixFragments: [String]?
     private var initialReadySignaled = false
     private let initialReadySemaphore = DispatchSemaphore(value: 0)
     private var fullListeners: [UUID: AsyncThrowingStream<MailMessage, Error>.Continuation] = [:]
@@ -211,6 +263,14 @@ public final class Client: @unchecked Sendable {
     }
 
     public func bind(prefix: String? = nil, pattern: String? = nil, suffix: String = Suffix.linuxdoSpace.rawValue, allowOverlap: Bool = false) throws -> MailBox {
+        try bind(prefix: prefix, pattern: pattern, resolved: resolveBindingSuffixInput(suffix), allowOverlap: allowOverlap)
+    }
+
+    public func bind(prefix: String? = nil, pattern: String? = nil, suffix: SemanticSuffix, allowOverlap: Bool = false) throws -> MailBox {
+        try bind(prefix: prefix, pattern: pattern, resolved: resolveBindingSuffixInput(suffix), allowOverlap: allowOverlap)
+    }
+
+    private func bind(prefix: String?, pattern: String?, resolved: (suffix: String, fragment: String?), allowOverlap: Bool) throws -> MailBox {
         lock.lock()
         let failure = fatalError
         let localClosed = closed
@@ -220,7 +280,7 @@ public final class Client: @unchecked Sendable {
         let hasPrefix = !(prefix ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasPattern = !(pattern ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if hasPrefix == hasPattern { throw LinuxDoSpaceError.invalidArgument("exactly one of prefix or pattern must be provided") }
-        let normalizedSuffix = try resolveBindingSuffix(suffix)
+        let normalizedSuffix = resolved.suffix
         if normalizedSuffix.isEmpty { throw LinuxDoSpaceError.invalidArgument("suffix must not be empty") }
 
         let normalizedPrefix = hasPrefix ? prefix!.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() : nil
@@ -235,6 +295,7 @@ public final class Client: @unchecked Sendable {
             guard var list = self.bindingsBySuffix[normalizedSuffix] else { return }
             list.removeAll { ObjectIdentifier($0.mailbox).hashValue.description == token }
             if list.isEmpty { self.bindingsBySuffix.removeValue(forKey: normalizedSuffix) } else { self.bindingsBySuffix[normalizedSuffix] = list }
+            _ = try? self.syncRemoteMailboxFilters(strict: false)
         }
         token = ObjectIdentifier(box).hashValue.description
 
@@ -244,6 +305,12 @@ public final class Client: @unchecked Sendable {
         list.append(binding)
         bindingsBySuffix[normalizedSuffix] = list
         lock.unlock()
+        do {
+            try syncRemoteMailboxFilters(strict: true)
+        } catch {
+            Task { await box.close() }
+            throw error
+        }
         return box
     }
 
@@ -367,7 +434,17 @@ public final class Client: @unchecked Sendable {
         let suffix = String(parts[1])
 
         lock.lock()
-        let chain = bindingsBySuffix[suffix] ?? []
+        var chain = bindingsBySuffix[suffix] ?? []
+        if chain.isEmpty {
+            let normalizedOwnerUsername = (ownerUsername ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalizedOwnerUsername.isEmpty {
+                let semanticDefaultSuffix = "\(normalizedOwnerUsername).\(Suffix.linuxdoSpace.rawValue)"
+                let semanticMailSuffix = "\(normalizedOwnerUsername)-mail.\(Suffix.linuxdoSpace.rawValue)"
+                if suffix == semanticDefaultSuffix {
+                    chain = bindingsBySuffix[semanticMailSuffix] ?? []
+                }
+            }
+        }
         lock.unlock()
         var matched: [Binding] = []
         for b in chain {
@@ -418,16 +495,17 @@ public final class Client: @unchecked Sendable {
         lock.lock()
         self.ownerUsername = ownerUsername
         lock.unlock()
+        try syncRemoteMailboxFilters(strict: true)
         signalInitialReadyIfNeeded(error: nil)
     }
 
-    private func resolveBindingSuffix(_ suffix: String) throws -> String {
+    private func resolveBindingSuffixInput(_ suffix: String) throws -> (suffix: String, fragment: String?) {
         let normalizedSuffix = suffix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalizedSuffix.isEmpty {
             throw LinuxDoSpaceError.invalidArgument("suffix must not be empty")
         }
         if normalizedSuffix != Suffix.linuxdoSpace.rawValue {
-            return normalizedSuffix
+            return (normalizedSuffix, nil)
         }
 
         lock.lock()
@@ -437,7 +515,92 @@ public final class Client: @unchecked Sendable {
         if normalizedOwnerUsername.isEmpty {
             throw LinuxDoSpaceError.streamFailed("stream bootstrap did not provide owner_username required to resolve Suffix.linuxdoSpace")
         }
-        return "\(normalizedOwnerUsername).\(normalizedSuffix)"
+        return ("\(normalizedOwnerUsername)-mail.\(normalizedSuffix)", "")
+    }
+
+    private func resolveBindingSuffixInput(_ suffix: SemanticSuffix) throws -> (suffix: String, fragment: String?) {
+        lock.lock()
+        let ownerUsername = self.ownerUsername
+        lock.unlock()
+        let normalizedOwnerUsername = (ownerUsername ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedOwnerUsername.isEmpty {
+            if suffix.mailSuffixFragment.isEmpty {
+                throw LinuxDoSpaceError.streamFailed("stream bootstrap did not provide owner_username required to resolve Suffix.linuxdoSpace")
+            }
+            throw LinuxDoSpaceError.streamFailed("stream bootstrap did not provide owner_username required to resolve Suffix.withSuffix(...)")
+        }
+        return ("\(normalizedOwnerUsername)-mail\(suffix.mailSuffixFragment).\(suffix.base.rawValue)", suffix.mailSuffixFragment)
+    }
+
+    private func syncRemoteMailboxFilters(strict: Bool) throws {
+        lock.lock()
+        let ownerUsername = (self.ownerUsername ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        lock.unlock()
+        if ownerUsername.isEmpty {
+            return
+        }
+
+        let fragments = collectRemoteMailboxSuffixFragments(ownerUsername: ownerUsername)
+        if fragments.isEmpty && syncedMailboxSuffixFragments == nil {
+            return
+        }
+        if let syncedMailboxSuffixFragments, syncedMailboxSuffixFragments == fragments {
+            return
+        }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("/v1/token/email/filters"))
+        request.httpMethod = "PUT"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["suffixes": fragments])
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var statusCode: Int?
+        var requestError: Error?
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            requestError = error
+            statusCode = (response as? HTTPURLResponse)?.statusCode
+            semaphore.signal()
+        }
+        task.resume()
+        semaphore.wait()
+
+        if let requestError {
+            if strict {
+                throw LinuxDoSpaceError.streamFailed("failed to synchronize remote mailbox filters: \(requestError.localizedDescription)")
+            }
+            return
+        }
+        guard let statusCode else {
+            if strict {
+                throw LinuxDoSpaceError.streamFailed("failed to synchronize remote mailbox filters: missing response")
+            }
+            return
+        }
+        if !(200...299).contains(statusCode) {
+            if strict {
+                throw LinuxDoSpaceError.streamFailed("unexpected mailbox filter sync status code: \(statusCode)")
+            }
+            return
+        }
+        syncedMailboxSuffixFragments = fragments
+    }
+
+    private func collectRemoteMailboxSuffixFragments(ownerUsername: String) -> [String] {
+        let rootSuffix = ".\(Suffix.linuxdoSpace.rawValue)"
+        let canonicalPrefix = "\(ownerUsername)-mail"
+        var fragments = Set<String>()
+        lock.lock()
+        defer { lock.unlock() }
+        for suffix in bindingsBySuffix.keys {
+            let normalizedSuffix = suffix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard normalizedSuffix.hasSuffix(rootSuffix) else { continue }
+            let label = String(normalizedSuffix.dropLast(rootSuffix.count))
+            guard !label.contains("."), label.hasPrefix(canonicalPrefix) else { continue }
+            fragments.insert(String(label.dropFirst(canonicalPrefix.count)))
+        }
+        return fragments.sorted()
     }
 
     private func signalInitialReadyIfNeeded(error: LinuxDoSpaceError?) {
